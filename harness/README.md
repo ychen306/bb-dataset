@@ -16,14 +16,17 @@ let throughput = (latency_a - latency_b) / (a - b)
 ```
 We are releasing a driver that does this automatically .
 
-Q: Why yet another tool for throughput profiling (nanoBench, Agner Fog's script, etc)?
+# Why you might want to use this tool
+
+Q: Why yet another tool for throughput profiling (nanoBench, Agner Fog's script, etc)?  
 A: Because sometimes you want to profile a piece of code with memory accesses,
 and it's hard to do the setup (i.e. proper memory allocation + initialization of registers to avoid crashing).
 
-Q: Does this always work (i.e. not crash)?
+Q: Does this always work (i.e. not crash)?  
 A: No, but it works most of the time.
 We have profiled 97% of basic blocks collected from raw binaries of various applications.
-And 94% out of all basic blocks are profiled with stable timing with no cache misses.
+And 94% out of all basic blocks are profiled with stable timing and no cache misses.
 
-Q: Does this work with basic blocks using RIP addressing?
+
+Q: Does this work with basic blocks using RIP addressing?  
 A: Not always, but most of the time.
