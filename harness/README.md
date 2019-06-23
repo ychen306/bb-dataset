@@ -14,7 +14,7 @@ let latency_a = measure code unrolled a times
 let latency_b = measure code unrolled b times
 let throughput = (latency_a - latency_b) / (a - b)
 ```
-We are releasing a driver that does this automatically .
+We are releasing a wrapper script that does this automatically .
 
 # Why you might want to use this tool
 
