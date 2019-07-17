@@ -7,12 +7,16 @@ DEBUG_FLAG =
 endif
 
 CFLAGS = $(DEBUG_FLAG)
-CC = /data/scratch/ychen306/gcc/gcc
 
 all: test
 
-test: test.o run_test.o rdpmc.o
+test: test.o run_test.o rdpmc.o libharness.a
 	$(CC) -o $@ $^ -lrt
+
+libharness.a: harness.o
+	ar -rcs $@ $^
+
+harness.o: harness.c harness.h
 
 rdpmc.o: rdpmc.c
 
