@@ -15,6 +15,7 @@
 %define PROT_WRITE  0x2
 
 %define MAP_SHARED  0x01
+%define MAP_FIXED	0x10
 
 %define tsc_offset      0
 %define core_cyc_offset 8
@@ -45,44 +46,6 @@
 
 %define reps 100
 
-%macro setup_memory 0
-  ; round code_begin/r13 down to page boundary
-  mov r13, code_begin
-  round_to_page_boundary(r13)
-  
-  ; unmap everything up to code_begin/r13
-  mov rax, sys_munmap
-  mov rdi, 0x0  ; addr
-  mov rsi, r13  ; len
-  syscall
-
-  ; round code_end/r14 up to page boundary
-  mov r14, code_end
-  add r14, page_size
-  add r14, page_size
-  round_to_page_boundary(r14)
-
-  ; unmap everything starting from code_end/r14
-  mov rdi, r14  ; addr
-  mov rsi, highest_addr
-  sub rsi, r14  ; len
-  mov rax, sys_munmap
-  syscall
-
-  ;; FIXME: only map aux mem *after* we've mapped pages for the test code
-  ; this way we can guarantee that the test code *does not* modify aux mem
-  ; map a page to keep the counters
-  mov rdi, aux_mem ; address
-  mov rsi, 8092               ; length
-  mov rdx, PROT_READ          ; prot
-  or  rdx, PROT_WRITE         ; --
-  mov r10, MAP_SHARED         ; flag
-  mov r8,  42                 ; fd
-  mov r9,  4096               ; offset
-  mov rax, sys_mmap
-  syscall
-%endmacro
-
 %macro round_to_page_boundary 1
   ; 2^12 = 4096
   shr %1, 12
@@ -91,11 +54,11 @@
 
 global run_test
 global map_and_restart
-%macro test_impl 0
-  %rep REPS
-  incbin "bb.bin"
-  %endrep
-%endmacro
+global map_aux_and_restart
+global first_legal_aux_mem_access
+
+global end_tmpl_begin
+global end_tmpl_end
 
 %macro align_stack 1
   ; ask ajay why we are doing this
@@ -103,7 +66,6 @@ global map_and_restart
   shl %1, 5
   sub %1, 0x10
 %endmacro
-
 
 global l1_read_misses_a
 global l1_read_misses_b
@@ -117,12 +79,16 @@ global code_end
 
 SECTION .text align = 4096
 
-%macro clear_flags 0
-  xor rax, rax
-  sahf
-%endmacro
-
 %macro initialize 0
+  ; flush subnormal floats to zeros
+  lea rsp, [init_value + 2048]
+  stmxcsr DWORD [rsp]
+  or     DWORD [rsp], 0x8000
+  ldmxcsr DWORD [rsp]
+  stmxcsr DWORD [rsp]
+  or     DWORD [rsp],0x40
+  ldmxcsr DWORD [rsp]
+
   ; reinitialize the page
   mov rdi, 512
   mov rbx, init_value
@@ -141,6 +107,10 @@ SECTION .text align = 4096
   mov rsp, rbp
 
   align_stack rbp
+
+  ; clear flags
+  xor rax, rax
+  sahf
   
   mov rax, init_value
   mov rbx, init_value 
@@ -156,8 +126,6 @@ SECTION .text align = 4096
   mov r13, init_value
   mov r14, init_value
   mov r15, init_value
-
-  clear_flags
 %endmacro
 ;
 %macro combine_rax_rdx 1
@@ -194,6 +162,60 @@ SECTION .text align = 4096
 ; acccidentally unmap itself
 code_begin: 
 
+;;;;; THIS IS THE ENTRY POINT 
+;;;; JUMP HERE AFTER YOU FORK
+;;;; the munmap code that follows is only reachable
+;;;; from the C code
+run_test:
+  ;;;; the C code passes size of the code as the argument
+  ; size-of-code = r11
+  mov r15, rdi
+
+  ; round code_begin/r13 down to page boundary
+  mov r13, code_begin
+  round_to_page_boundary(r13)
+  
+  ; unmap everything up to code_begin/r13
+  mov rax, sys_munmap
+  mov rdi, 0x0  ; addr
+  mov rsi, r13  ; len
+  syscall
+
+  ; round code_end/r14 up to page boundary
+  mov r14, code_end
+  add r14, r15
+  ;; FIXME this looks fishy, fix it
+  add r14, page_size
+  add r14, page_size
+  round_to_page_boundary(r14)
+
+  ; unmap everything starting from code_end/r14
+  mov rdi, r14  ; addr
+  mov rsi, highest_addr
+  sub rsi, r14  ; len
+  mov rax, sys_munmap
+  syscall
+
+  jmp test_code
+
+map_aux_and_restart:
+  ; this is similar to map_and_restart, except at this point
+  ; we know for sure that the code being tested DOES NOT 
+  ; access aux mem and doesn't crash
+  mov rdi, aux_mem ; address
+  mov rsi, 8092               ; length
+  mov rdx, PROT_READ          ; prot
+  or  rdx, PROT_WRITE         ; --
+  mov r10, MAP_SHARED         ; flag
+  or  r10, MAP_FIXED          ; --
+  mov r8,  42                 ; fd
+  mov r9,  4096               ; offset
+  mov rax, sys_mmap
+  syscall
+
+  jmp test_code
+
+;;; THE PARENT CALLS THIS WHEN WE FAULT
 map_and_restart:
   ; mmap the page containing rax
   round_to_page_boundary(rax)
@@ -207,103 +229,9 @@ map_and_restart:
   syscall
 
   ; now go back to the test code
-  jmp test_begin
+  jmp test_code
 
-run_test:
-  ; flush subnormal floats to zeros
-  stmxcsr DWORD [rsp]
-  or     DWORD [rsp], 0x8000
-  ldmxcsr DWORD [rsp]
-  stmxcsr DWORD [rsp]
-  or     DWORD [rsp],0x40
-  ldmxcsr DWORD [rsp]
-
-  setup_memory
-
-  ; ready to go. 
-  ; get the parent process to trigger
-  ; a map containing init_value
-  int 3
-
-test_begin:
-  initialize
-
-  ;; do mappings
-  test_impl
-
-%if debug
-  mov       rax, 1                  ; system call for write
-  mov       rdi, 1                  ; file handle 1 is stdout
-  mov       rsi, msg_mapping_done            ; address of string to output
-  mov       rdx, 17                 ; number of bytes
-  syscall                           ; invoke operating system to do the write
-%endif
-
-
-  ;;;;;;;;;;; TEST BEGIN ;;;;;;;;;;;
-
-  mov rbx, iterator
-  mov qword [rbx], 0
-
-test_loop:
-
-  mov rax, counter_array 
-
-  ; rbx = i
-  mov rbx, iterator
-  mov rbx, [rbx]
-
-  ; r15 = counter + i*(size of one set of counters)
-  mov r15, rbx
-  imul r15, counter_set_size
-  add r15, rax
-
-  ; record the number of ctx switches
-  ; syscall preserves values of r15,
-  ; so we are in good shape
-  lea rdx, [r15 + ctx_swtch_offset]
-  read ctx_swtch_fd, rdx, 8
-
-  ; initialize now because sycall overwrites some regs
-  mov rdx, tmp
-  mov [rdx], r15
-  initialize
-  mov rdx, tmp
-  mov r15, [rdx]
-  
-  ; bring in cache before we measure cache misses
-  mov [r15], rax
-  cpuid ;
-
-  ; read cache misses before we serialize and read cycles
-  ; put a label here so that we can override the pmc index
-l1_read_misses_a:
-  read_perf_counter 0, rcx
-  mov [r15 + l1_read_misses_offset], rcx
-
-l1_write_misses_a:
-  read_perf_counter 0, rcx
-  mov [r15 + l1_write_misses_offset], rcx
-
-icache_misses_a:
-  read_perf_counter 0, rcx
-  mov [r15 + icache_misses_offset], rcx
-
-  cpuid ; serialize
-
-  read_perf_counter counter_core_cyc, rcx
-  mov [r15 + core_cyc_offset], rcx
-
-; re-initialize clobbered registers
-  clear_flags
-  mov rax, r11
-  mov rbx, rax
-  mov rcx, rax
-  mov rdx, rax
-  mov r15, rax
-
-  test_impl
-
+end_tmpl_begin:
   ;; CPUID's runtime depends on value of rax!!!
   xor rax, rax
   cpuid ; serialize
@@ -327,10 +255,16 @@ l1_write_misses_b:
   read_perf_counter 0, r14
 icache_misses_b:
   read_perf_counter 0, r8
+
+end_tmpl_end:
+
+align 4096
+test_end:
   mov rax, counter_array 
 
   ; rbx = i
   mov rbx, iterator
+first_legal_aux_mem_access:
   mov rbx, [rbx]
 
   ; r15 = counter + 8 + i*(size of one set of counters)
@@ -368,30 +302,65 @@ icache_misses_b:
   mov qword [r15 + ctx_swtch_offset], rcx
 
   inc rbx
+  mov rcx, iterator
+  mov [rcx], rbx
   cmp rbx, iterations
-  mov rax, iterator
-  mov [rax], rbx
   jb test_loop
-
-  ;;;;;;;;;;; TEST END ;;;;;;;;;;;
-
-%if debug
-  mov       rax, 1                  ; system call for write
-  mov       rdi, 1                  ; file handle 1 is stdout
-  mov       rsi, msg_test_done      ; address of string to output
-  mov       rdx, 17                 ; number of bytes
-  syscall                           ; invoke operating system to do the write
-%endif
 
   mov rdi, 0
   mov rax, sys_exit
   syscall
+  
+test_loop:
 
-%if debug
-msg_mapping_done: db "finished mapping", 10
-msg_test_done: db "finished testing", 10
-%endif
+  mov rax, counter_array 
 
-; marker of the begin of test code,
+  ; rbx = i
+  ;mov rbx, iterator
+  ;mov rbx, [rbx]
+
+  ;; r15 = counter + i*(size of one set of counters)
+  ;mov r15, rbx
+  ;imul r15, counter_set_size
+  ;add r15, rax
+
+  add r15, counter_set_size
+
+  ; record the number of ctx switches
+  ; syscall preserves values of r15,
+  ; so we are in good shape
+  lea rdx, [r15 + ctx_swtch_offset]
+  read ctx_swtch_fd, rdx, 8
+
+  ; bring in cache before we measure cache misses
+  mov [r15], rax
+  cpuid
+
+  ; read cache misses before we serialize and read cycles
+  ; put a label here so that we can override the pmc index
+l1_read_misses_a:
+  read_perf_counter 0, rcx
+  mov [r15 + l1_read_misses_offset], rcx
+
+l1_write_misses_a:
+  read_perf_counter 0, rcx
+  mov [r15 + l1_write_misses_offset], rcx
+
+icache_misses_a:
+  read_perf_counter 0, rcx
+  mov [r15 + icache_misses_offset], rcx
+
+  cpuid ; serialize
+
+  read_perf_counter counter_core_cyc, rcx
+  mov [r15 + core_cyc_offset], rcx
+
+test_code:
+  initialize
+  jmp code_end
+  jmp test_end
 code_end:
-  nop
+  ; the parent is going to append the test code here
+  ; insert
+  ; jmp to `jmp test_end` before code_end
+  resb 0x1000000

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/syscall.h>
+#include <assert.h>
 
 #include <sched.h>
 #include <sys/time.h>
@@ -22,9 +23,13 @@
 #include <linux/perf_event.h>
 #include <linux/ioctl.h>
 
+#define SIZE_OF_REL_JUMP (5)
+
 #define SHM_FD 42
 
 #define INIT_VALUE 0x2324000
+
+#define ADDR_OF_AUX_MEM 0x0000700000000000
 
 #define CTX_SWTCH_FD 100
 
@@ -44,6 +49,7 @@ extern void run_test_nop();
 // we don't really care about signature of the function here
 // just need the address
 extern void map_and_restart();
+extern void map_aux_and_restart();
 
 // addresses of the `mov rcx, *` instructions
 // before we run rdpmc. we modify these instructions
@@ -58,6 +64,11 @@ extern char icache_misses_b[];
 // boundary of the actual test harness
 extern char code_begin[];
 extern char code_end[];
+
+extern char end_tmpl_begin[];
+extern char end_tmpl_end[];
+
+extern char first_legal_aux_mem_access[];
 
 struct perf_event_attr l1_read_attr = {
   .type = PERF_TYPE_HW_CACHE,
@@ -176,19 +187,19 @@ struct pmc_counters {
 
 // return counters
 struct pmc_counters *measure(
+    char *code_to_test,
+    unsigned long code_size,
+    unsigned int unroll_factor,
     int *l1_read_supported,
     int *l1_write_supported,
-    int *icache_supported) {
-  // allocate 3 pages, the first one for testing
-  // the rest for writing down result
-  int shm_fd = create_shm_fd("shm-path", 4096 * 3);
-
+    int *icache_supported,
+    int shm_fd) {
   int fds[2];
   pipe(fds);
 
   char *aux_mem = mmap(NULL, 4096 * 2, PROT_READ|PROT_WRITE, MAP_SHARED, shm_fd, 4096);
   perror("mmap aux mem");
-    bzero(aux_mem, 4096);
+  bzero(aux_mem, 4096*2);
 
   pid_t pid = fork();
   if (pid) { // parent process
@@ -203,6 +214,10 @@ struct pmc_counters *measure(
     *l1_read_supported = is_event_supported(&l1_read_attr);
     *l1_write_supported = is_event_supported(&l1_write_attr);
     *icache_supported = is_event_supported(&icache_attr);
+
+    char *last_failing_inst = 0;
+
+    int mapping_done = 0;
 
     // TODO: kill the child
     int i;
@@ -219,13 +234,18 @@ struct pmc_counters *measure(
 
       // something wrong must have happened
       // find out what happened
+      // if we have done mapping then nothing should go wrong
+      if (mapping_done) {
+        break;
+      }
       siginfo_t sinfo;
       ptrace(PTRACE_GETSIGINFO, pid, NULL, &sinfo);
       struct user_regs_struct regs;
       ptrace(PTRACE_GETREGS, pid, NULL, &regs);
       LOG("bad inst is at %p, signal = %d\n", (void *)regs.rip, sinfo.si_signo);
+      LOG("VAL OF RSP = %p\n", (void *)regs.rsp);
       if (sinfo.si_signo != 11 && sinfo.si_signo != 5)
-        abort();
+        break;
 
       // find out address causing the segfault
       void *fault_addr = sinfo.si_addr;
@@ -233,11 +253,18 @@ struct pmc_counters *measure(
       if (sinfo.si_signo == 5)
         fault_addr = (void *)INIT_VALUE;
 
-      // before we restart, we initialize child_mem for consistency
-      int i;
-      for (i = 0; i < 512; i++) {
-        ((unsigned long *)child_mem)[i] = INIT_VALUE;
-      }
+      if ((char *)regs.rip == last_failing_inst)
+        break;
+
+
+      last_failing_inst = (char *)regs.rip;
+
+      if ((char *)regs.rip == first_legal_aux_mem_access) {
+        mapping_done = 1;
+        restart_addr = &map_aux_and_restart;
+      } else if (fault_addr == (void *)ADDR_OF_AUX_MEM)
+        break;
+
       restart_child(pid, restart_addr, fault_addr, shm_fd);
     }
 
@@ -267,14 +294,17 @@ struct pmc_counters *measure(
     }
     dup2(ctx.fd, CTX_SWTCH_FD);
 
-    errno = 0;
+    unsigned long end_tmpl_size = end_tmpl_end - end_tmpl_begin;
+    unsigned long total_code_size =
+      code_size * unroll_factor + end_tmpl_size + SIZE_OF_REL_JUMP;
 
     // unprotect the test harness 
     // so that we can emit instructions to use
     // the proper pmc index
     char *begin = round_to_page_start(code_begin);
-    char *end = round_to_next_page(code_end);
-    mprotect(begin, end-begin, PROT_EXEC|PROT_READ|PROT_WRITE);
+    char *end = round_to_next_page(code_end + total_code_size);
+    errno = 0;
+    mprotect(begin, end-begin, PROT_READ|PROT_WRITE);
     perror("mprotect");
 
     emit_mov_rcx(l1_read_misses_a, l1_read_misses_idx);
@@ -284,12 +314,26 @@ struct pmc_counters *measure(
     emit_mov_rcx(icache_misses_a, icache_misses_idx);
     emit_mov_rcx(icache_misses_b, icache_misses_idx);
 
+    // copy the *unrolled* user code 
+    unsigned char *code_dest = code_end;
+    int i;
+    for (i = 0; i < unroll_factor; i++) {
+      memcpy(code_dest, code_to_test, code_size);
+      code_dest += code_size;
+    }
+
+    // copy the END measurement code
+    memcpy(code_dest, end_tmpl_begin, end_tmpl_size);
+    code_dest += end_tmpl_size;
+
+    // insert a rel. jump that brings us back to test_end
+    *code_dest = 0xe9;
+    *(int *)(code_dest+1) = -(total_code_size + SIZE_OF_REL_JUMP);
+
     // re-protect the harness
+    errno = 0;
     mprotect(begin, end-begin, PROT_EXEC);
     perror("mprotect");
-
-    // setup counter for core cycle
-    rdpmc_open(PERF_COUNT_HW_CPU_CYCLES, &ctx);
 
     // wait for parent
     close(fds[1]);
@@ -304,7 +348,7 @@ struct pmc_counters *measure(
     setpriority(PRIO_PROCESS, 0, 0);
 
     // this does not return
-    run_test();
+    run_test(total_code_size);
   }
 
   // this is unreachable
@@ -335,14 +379,31 @@ compute_overhead(struct pmc_counters *counters,
   *core_cyc_overhead /= num_acceptable_tests;
 }
 
-int main() {
+int main(int argc, char **argv) {
+  char *code_file_name = argv[1];
+  unsigned int unroll_factor = atoi(argv[2]);
+  FILE *code_file = fopen(code_file_name, "rb");
+  fseek(code_file, 0, SEEK_END);
+  unsigned long code_size = ftell(code_file);
+  fseek(code_file, 0, SEEK_SET);
+  char *code_to_test = malloc(code_size);
+  unsigned long bytes_read = fread(code_to_test, 1, code_size, code_file);
+  assert(bytes_read == code_size);
+
+  // allocate 3 pages, the first one for testing
+  // the rest for writing down result
+  int shm_fd = create_shm_fd("shm-path", 4096 * 3);
+
   // `measure` writes the result here
   int l1_read_supported, l1_write_supported, icache_supported;
-  struct pmc_counters *counters = measure(&l1_read_supported, &l1_write_supported, &icache_supported);
+  struct pmc_counters *counters = measure(
+      code_to_test, code_size, unroll_factor,
+      &l1_read_supported, &l1_write_supported, &icache_supported, 
+      shm_fd);
 
 
   if (!counters) {
-    fprintf(stderr, "failed to run test\n");
+    LOG("failed to run test\n");
     return 1;
   }
 

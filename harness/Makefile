@@ -19,7 +19,7 @@ rdpmc.o: rdpmc.c
 test.o: test.c
 
 run_test.o: run_test.nasm bb.bin
-	nasm -f elf64 -o $@ $< $(DEBUG_FLAG) -DREPS=$(REPS)
+	nasm -f elf64 -o $@ $< $(DEBUG_FLAG)
 
 clean:
 	rm -f run_test.o test.o rdpmc.o test
